@@ -41,13 +41,12 @@ describe("guide pathway persistence flow", () => {
     vi.clearAllMocks();
   });
 
-  it("rejects save intent when no conversation draft exists", async () => {
-    saveConversationPathway.mockResolvedValueOnce(null);
+  it("does not auto-save when the AI reports save intent", async () => {
     llmReply(true);
     const result = await appRouter.createCaller(context).guide.respond({ profile: "{}", history: [], message: "save this", conversationId: 91 });
     expect(result.pathway).toBeNull();
-    expect(saveConversationPathway).toHaveBeenCalledWith(7, 91);
-    expect(upsertDraft).not.toHaveBeenCalled();
+    expect(saveConversationPathway).not.toHaveBeenCalled();
+    expect(upsertDraft).toHaveBeenCalledWith(7, 91, readyPathway, expect.any(String));
   });
 
   it("promotes a real pathway record into saved state and inserts its checklist exactly once", async () => {
@@ -110,8 +109,11 @@ describe("guide pathway persistence flow", () => {
     expect(upsertDraft).toHaveBeenCalledWith(7, 92, readyPathway, expect.any(String));
 
     llmReply(true);
-    const savedResult = await appRouter.createCaller(context).guide.respond({ profile: "{}", history: [], message: "save this pathway", conversationId: 92 });
-    expect(savedResult.pathway).toMatchObject({ id: 12, conversationId: 92, isSaved: 1 });
+    const readyResult = await appRouter.createCaller(context).guide.respond({ profile: "{}", history: [], message: "save this pathway", conversationId: 92 });
+    expect(readyResult.pathway).toBeNull();
+    expect(saveConversationPathway).not.toHaveBeenCalled();
+    const savedResult = await appRouter.createCaller(context).pathways.save({ conversationId: 92 });
+    expect(savedResult).toMatchObject({ id: 12, conversationId: 92, isSaved: 1 });
     expect(saveConversationPathway).toHaveBeenCalledWith(7, 92);
   });
 });
