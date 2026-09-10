@@ -101,6 +101,13 @@ describe("guide pathway persistence flow", () => {
     ]);
   });
 
+  it("completes a pathway from accumulated context when the user chooses Complete pathway", async () => {
+    saveConversationPathway.mockResolvedValueOnce({ id: 13, conversationId: 94, isSaved: 1 });
+    llmReply(false);
+    const result = await appRouter.createCaller(context).guide.respond({ profile: JSON.stringify({ goal: "IT support", province: "Western Cape" }), history: [{ role: "user", content: "I need remote work" }], message: "Complete pathway", conversationId: 94, completePathway: true });
+    expect(result.pathway).toMatchObject({ id: 13, conversationId: 94, isSaved: 1 });
+    expect(saveConversationPathway).toHaveBeenCalledWith(7, 94);
+  });
   it("creates and immediately promotes a complete pathway in one guide response", async () => {
     upsertDraft.mockResolvedValueOnce({ id: 12, conversationId: 92, isSaved: 0 });
     saveConversationPathway.mockResolvedValueOnce({ id: 12, conversationId: 92, isSaved: 1 });
