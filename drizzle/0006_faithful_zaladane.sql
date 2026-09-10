@@ -1,0 +1,1 @@
+ALTER TABLE `pathways` ADD `isSaved` tinyint DEFAULT 0 NOT NULL;

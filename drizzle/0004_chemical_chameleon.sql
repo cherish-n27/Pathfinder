@@ -1,0 +1,1 @@
+ALTER TABLE `opportunities` ADD `verificationStatus` enum('verified','needs_review') DEFAULT 'needs_review' NOT NULL;

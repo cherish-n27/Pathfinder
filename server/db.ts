@@ -1,92 +1,48 @@
-import { eq } from "drizzle-orm";
+import { and, asc, desc, eq, gte, like, lt, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { InsertUser, users } from "../drizzle/schema";
-import { ENV } from './_core/env';
+import { applications, conversations, messages, opportunities, pathwayChecklistItems, pathways, profiles, promptLibrary, savedOpportunities, InsertUser, users } from "../drizzle/schema";
+import { ENV } from "./_core/env";
+import { hasVerifiableSource, normalizeSourceUrl } from "../shared/sourceIntegrity";
+import { buildPathwayChecklist, buildPromotionPlan } from "../shared/pathwaySave";
+import { deadlineDateKey, isDeadlineInRange } from "../shared/deadlineCalendar";
 
 let _db: ReturnType<typeof drizzle> | null = null;
+export async function getDb() { if (!_db && process.env.DATABASE_URL) { try { _db = drizzle(process.env.DATABASE_URL); } catch (error) { console.warn("[Database] Failed to connect:", error); _db = null; } } return _db; }
+export async function upsertUser(user: InsertUser): Promise<void> { if (!user.openId) throw new Error("User openId is required for upsert"); const db = await getDb(); if (!db) return; const values: InsertUser = { openId: user.openId }; const updateSet: Record<string, unknown> = {}; (["name", "email", "loginMethod"] as const).forEach(field => { if (user[field] !== undefined) { values[field] = user[field] ?? null; updateSet[field] = user[field] ?? null; } }); values.lastSignedIn = user.lastSignedIn ?? new Date(); updateSet.lastSignedIn = values.lastSignedIn; if (user.role) { values.role = user.role; updateSet.role = user.role; } else if (user.openId === ENV.ownerOpenId) { values.role = "admin"; updateSet.role = "admin"; } await db.insert(users).values(values).onDuplicateKeyUpdate({ set: updateSet }); }
+export async function getUserByOpenId(openId: string) { const db = await getDb(); if (!db) return undefined; const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1); return result[0]; }
+export async function listOpportunities(search?: string, category?: "Study" | "Work" | "Skills" | "Business", province?: string) { const db = await getDb(); if (!db) return []; const filters = []; if (category) filters.push(eq(opportunities.category, category)); if (province) filters.push(eq(opportunities.province, province)); if (search) filters.push(or(like(opportunities.name, `%${search}%`), like(opportunities.organisation, `%${search}%`), like(opportunities.description, `%${search}%`), like(opportunities.traits, `%${search}%`))); const rows = await db.select().from(opportunities).where(filters.length ? and(...filters) : undefined).orderBy(desc(opportunities.sourceUpdatedAt)); return rows.filter(row => hasVerifiableSource(row.sourceUrl)); }
+export async function listPromptLibrary() { const db = await getDb(); if (!db) return []; return db.select().from(promptLibrary).orderBy(asc(promptLibrary.category), asc(promptLibrary.displayOrder)); }
+export async function createConversation(userId: number, title?: string) { const db = await getDb(); if (!db) return null; const result = await db.insert(conversations).values({ userId, title: title || "New career conversation" }); const rows = await db.select().from(conversations).where(eq(conversations.id, Number(result[0].insertId))).limit(1); return rows[0] ?? null; }
+export async function listConversations(userId: number) { const db = await getDb(); if (!db) return []; return db.select().from(conversations).where(eq(conversations.userId, userId)).orderBy(desc(conversations.updatedAt)); }
+export async function listMessages(userId: number, conversationId: number) { const db = await getDb(); if (!db) return []; const owned = await db.select().from(conversations).where(and(eq(conversations.id, conversationId), eq(conversations.userId, userId))).limit(1); if (!owned[0]) return []; return db.select().from(messages).where(eq(messages.conversationId, conversationId)).orderBy(asc(messages.createdAt)); }
+export async function addMessage(userId: number, conversationId: number, sender: "user" | "assistant", message: string) { const db = await getDb(); if (!db) return null; const owned = await db.select().from(conversations).where(and(eq(conversations.id, conversationId), eq(conversations.userId, userId))).limit(1); if (!owned[0]) return null; const result = await db.insert(messages).values({ conversationId, sender, message }); await db.update(conversations).set({ updatedAt: new Date() }).where(eq(conversations.id, conversationId)); const rows = await db.select().from(messages).where(eq(messages.id, Number(result[0].insertId))).limit(1); return rows[0] ?? null; }
+export async function toggleSavedOpportunity(userId: number, opportunityId: number | undefined, snapshotData: string) { const db = await getDb(); if (!db) return { saved: false, item: null }; let parsed: { sourceUrl?: string }; try { parsed = JSON.parse(snapshotData); } catch { throw new Error("Saved opportunity data must be valid JSON"); } if (!hasVerifiableSource(parsed.sourceUrl)) throw new Error("A verifiable HTTPS source URL is required"); const existing = await db.select().from(savedOpportunities).where(eq(savedOpportunities.userId, userId)); const match = existing.find(row => { if (opportunityId !== undefined && row.opportunityId === opportunityId) return true; try { const saved = JSON.parse(row.snapshotData || "{}"); return Boolean(parsed.sourceUrl && saved.sourceUrl === parsed.sourceUrl); } catch { return false; } }); if (match) { await db.delete(savedOpportunities).where(eq(savedOpportunities.id, match.id)); return { saved: false, item: match }; } const result = await db.insert(savedOpportunities).values({ userId, opportunityId, snapshotData }); const rows = await db.select().from(savedOpportunities).where(eq(savedOpportunities.id, Number(result[0].insertId))).limit(1); return { saved: true, item: rows[0] ?? null }; }
+export async function listSavedOpportunities(userId: number) { const db = await getDb(); if (!db) return []; return db.select().from(savedOpportunities).where(eq(savedOpportunities.userId, userId)).orderBy(desc(savedOpportunities.createdAt)); }
+export async function listApplications(userId: number) { const db = await getDb(); if (!db) return []; return db.select().from(applications).where(eq(applications.userId, userId)).orderBy(desc(applications.deadlineDate)); }
+export async function listDeadlineItems(userId: number, from: Date, to: Date) { const db = await getDb(); if (!db) return []; const rows = await db.select().from(applications).where(eq(applications.userId, userId)).orderBy(asc(applications.deadlineDate)); const applicationItems = rows.filter(row => isDeadlineInRange(row.deadlineDate, from, to)).map(row => ({ ...row, source: "application" as const })); const saved = await db.select().from(savedOpportunities).where(eq(savedOpportunities.userId, userId)); const savedItems = saved.flatMap(item => { try { const snapshot = JSON.parse(item.snapshotData || "{}"); const raw = snapshot.deadlineDate ?? snapshot.deadline_date; const deadline = raw ? new Date(raw) : null; if (!deadline || Number.isNaN(deadline.getTime()) || !isDeadlineInRange(raw, from, to)) return []; return [{ id: `saved-${item.id}`, title: snapshot.title ?? snapshot.name ?? "Saved opportunity", organisation: snapshot.organisation ?? snapshot.org ?? "Saved opportunity", type: snapshot.type ?? snapshot.category ?? "Other", deadlineDate: deadline, status: snapshot.status ?? "Saved", source: "saved" as const }]; } catch { return []; } }); return [...applicationItems, ...savedItems].sort((a, b) => (deadlineDateKey(a.deadlineDate!) || "").localeCompare(deadlineDateKey(b.deadlineDate!) || "")); }
+export async function listUpcomingDeadlines(userId: number, now = new Date(), days = 7) { const from = new Date(now); from.setHours(0, 0, 0, 0); const to = new Date(from); to.setDate(to.getDate() + days + 1); return listDeadlineItems(userId, from, to); }
+export async function createApplication(userId: number, input: Omit<typeof applications.$inferInsert, "userId">) { const db = await getDb(); if (!db) return null; const result = await db.insert(applications).values({ ...input, userId }); const id = Number(result[0].insertId); const rows = await db.select().from(applications).where(eq(applications.id, id)).limit(1); return rows[0] ?? null; }
+export async function upsertProfile(userId: number, data: Omit<typeof profiles.$inferInsert, "userId">) { const db = await getDb(); if (!db) return null; const existing = await db.select().from(profiles).where(eq(profiles.userId, userId)).limit(1); if (existing[0]) { await db.update(profiles).set(data).where(eq(profiles.id, existing[0].id)); return { ...existing[0], ...data }; } const result = await db.insert(profiles).values({ ...data, userId }); return { id: Number(result[0].insertId), ...data, userId }; }
+export async function listPathways(userId: number) { const db = await getDb(); if (!db) return []; return db.select().from(pathways).where(and(eq(pathways.userId, userId), eq(pathways.isSaved, 1))).orderBy(desc(pathways.createdAt)); }
+export async function listChecklistItems(userId: number, pathwayId: number) { const db = await getDb(); if (!db) return []; const owned = await db.select().from(pathways).where(and(eq(pathways.id, pathwayId), eq(pathways.userId, userId))).limit(1); if (!owned[0]) return []; return db.select().from(pathwayChecklistItems).where(eq(pathwayChecklistItems.pathwayId, pathwayId)).orderBy(asc(pathwayChecklistItems.sortOrder)); }
+export async function updateChecklist(userId: number, itemId: number, isComplete: number) { const db = await getDb(); if (!db) return null; const rows = await db.select({ item: pathwayChecklistItems, pathway: pathways }).from(pathwayChecklistItems).innerJoin(pathways, eq(pathwayChecklistItems.pathwayId, pathways.id)).where(and(eq(pathwayChecklistItems.id, itemId), eq(pathways.userId, userId))).limit(1); if (!rows[0]) return null; await db.update(pathwayChecklistItems).set({ isComplete }).where(eq(pathwayChecklistItems.id, itemId)); return { ...rows[0].item, isComplete }; }
 
-// Lazily create the drizzle instance so local tooling can run without a DB.
-export async function getDb() {
-  if (!_db && process.env.DATABASE_URL) {
-    try {
-      _db = drizzle(process.env.DATABASE_URL);
-    } catch (error) {
-      console.warn("[Database] Failed to connect:", error);
-      _db = null;
-    }
-  }
-  return _db;
-}
+export async function updateApplication(userId: number, id: number, input: Partial<Omit<typeof applications.$inferInsert, "userId" | "id">>) { const db = await getDb(); if (!db) return null; await db.update(applications).set(input).where(and(eq(applications.id, id), eq(applications.userId, userId))); const rows = await db.select().from(applications).where(and(eq(applications.id, id), eq(applications.userId, userId))).limit(1); return rows[0] ?? null; }
+export async function deleteApplication(userId: number, id: number) { const db = await getDb(); if (!db) return false; await db.delete(applications).where(and(eq(applications.id, id), eq(applications.userId, userId))); return true; }
 
-export async function upsertUser(user: InsertUser): Promise<void> {
-  if (!user.openId) {
-    throw new Error("User openId is required for upsert");
-  }
+export async function getProfile(userId: number) { const db = await getDb(); if (!db) return null; const rows = await db.select().from(profiles).where(eq(profiles.userId, userId)).limit(1); return rows[0] ?? null; }
 
-  const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot upsert user: database not available");
-    return;
-  }
+export async function searchLiveOpportunities(query: string, category?: string, province?: string) { const searchQuery = [query || "South Africa youth career opportunities", category, province].filter(Boolean).join(" "); const apiKey = process.env.TAVILY_API_KEY; if (!apiKey) return { results: [], fallback: true, message: "Live search is not configured, so you are seeing curated opportunities." }; try { const response = await fetch("https://api.tavily.com/search", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: apiKey, query: searchQuery, search_depth: "basic", max_results: 8, include_answer: false }) }); if (!response.ok) return { results: [], fallback: true, message: "Live search is temporarily unavailable, so you are seeing curated opportunities." }; const payload = await response.json() as { results?: { title?: string; url?: string; content?: string }[] }; const results = (payload.results || []).map(item => ({ ...item, url: normalizeSourceUrl(item.url) })).filter(item => Boolean(item.url)).map(item => { const title = item.title || "Opportunity from live search"; const categoryGuess = /bursar|univers|college|course|study|scholar/i.test(title) ? "Study" : /job|intern|work|employment|learnership/i.test(title) ? "Work" : /business|enterprise|entrepreneur|fund/i.test(title) ? "Business" : "Skills"; return { id: undefined, name: title, organisation: new URL(item.url!).hostname.replace(/^www\./, ""), category: categoryGuess, description: (item.content || "Review the official source for current requirements.").slice(0, 260), traits: "Live result,verify source", province: province || "National", deadlineDate: null, sourceUrl: item.url!, sourceUpdatedAt: new Date(), source: "live" as const }; }); return { results, fallback: false, message: "From live search — verify before applying." }; } catch { return { results: [], fallback: true, message: "Live search timed out, so you are seeing curated opportunities." }; } }
 
-  try {
-    const values: InsertUser = {
-      openId: user.openId,
-    };
-    const updateSet: Record<string, unknown> = {};
+type StructuredPathwayInput = { recommended_direction: string; goal: string; education: string; interests_or_skills: string; province: string; constraint: string; reasons: string; next_steps: string[]; immediate_action: string };
 
-    const textFields = ["name", "email", "loginMethod"] as const;
-    type TextField = (typeof textFields)[number];
+function pathwayValues(userId: number, conversationId: number, pathway: StructuredPathwayInput, assistantReply: string, isSaved: number) { const nextSteps = Array.isArray(pathway.next_steps) ? pathway.next_steps.filter(step => typeof step === "string" && step.trim()).map(step => step.trim()).slice(0, 8) : []; return { userId, conversationId, isSaved, goal: pathway.goal.slice(0, 500), currentSituation: `${pathway.education}; ${pathway.interests_or_skills}; ${pathway.province}; constraint: ${pathway.constraint}`.slice(0, 500), recommendedDirection: pathway.recommended_direction.slice(0, 180), reasons: pathway.reasons.slice(0, 1200) || assistantReply.slice(0, 1200), nextSteps: nextSteps.join("; ").slice(0, 1200), alternativeOptions: "Study, work, skills, or entrepreneurship routes can all be explored", immediateAction: pathway.immediate_action.slice(0, 500), matchScore: 78 }; }
 
-    const assignNullable = (field: TextField) => {
-      const value = user[field];
-      if (value === undefined) return;
-      const normalized = value ?? null;
-      values[field] = normalized;
-      updateSet[field] = normalized;
-    };
+export async function upsertPersonalisedPathwayDraft(userId: number, conversationId: number, pathway: StructuredPathwayInput, assistantReply: string) { const db = await getDb(); if (!db) return null; const values = pathwayValues(userId, conversationId, pathway, assistantReply, 0); const existing = await db.select().from(pathways).where(and(eq(pathways.userId, userId), eq(pathways.conversationId, conversationId))).orderBy(desc(pathways.id)).limit(1); if (existing[0]) { await db.update(pathways).set({ ...values, isSaved: existing[0].isSaved }).where(eq(pathways.id, existing[0].id)); const rows = await db.select().from(pathways).where(eq(pathways.id, existing[0].id)).limit(1); return rows[0] ?? null; } const result = await db.insert(pathways).values(values); const rows = await db.select().from(pathways).where(eq(pathways.id, Number(result[0].insertId))).limit(1); return rows[0] ?? null; }
 
-    textFields.forEach(assignNullable);
+export async function promotePathwayRecord(db: ReturnType<typeof drizzle>, pathway: typeof pathways.$inferSelect) { if (pathway.isSaved) return pathway; const promotion = buildPromotionPlan({ next_steps: (pathway.nextSteps || "").split("; ").filter(Boolean), immediate_action: pathway.immediateAction || "" }); await db.update(pathways).set({ isSaved: promotion.isSaved }).where(eq(pathways.id, pathway.id)); await db.insert(pathwayChecklistItems).values(promotion.checklist.map((text, index) => ({ pathwayId: pathway.id, text, isComplete: 0, isCustom: 0, sortOrder: index }))); return { ...pathway, isSaved: promotion.isSaved }; }
 
-    if (user.lastSignedIn !== undefined) {
-      values.lastSignedIn = user.lastSignedIn;
-      updateSet.lastSignedIn = user.lastSignedIn;
-    }
-    if (user.role !== undefined) {
-      values.role = user.role;
-      updateSet.role = user.role;
-    } else if (user.openId === ENV.ownerOpenId) {
-      values.role = 'admin';
-      updateSet.role = 'admin';
-    }
+export async function saveConversationPathway(userId: number, conversationId: number, dbOverride?: ReturnType<typeof drizzle> | null) { const db = dbOverride ?? await getDb(); if (!db) return null; const existing = await db.select().from(pathways).where(and(eq(pathways.userId, userId), eq(pathways.conversationId, conversationId))).orderBy(desc(pathways.id)).limit(1); if (!existing[0]) return null; const promoted = await promotePathwayRecord(db, existing[0]); const rows = await db.select().from(pathways).where(eq(pathways.id, existing[0].id)).limit(1); return rows[0] ?? promoted ?? null; }
 
-    if (!values.lastSignedIn) {
-      values.lastSignedIn = new Date();
-    }
-
-    if (Object.keys(updateSet).length === 0) {
-      updateSet.lastSignedIn = new Date();
-    }
-
-    await db.insert(users).values(values).onDuplicateKeyUpdate({
-      set: updateSet,
-    });
-  } catch (error) {
-    console.error("[Database] Failed to upsert user:", error);
-    throw error;
-  }
-}
-
-export async function getUserByOpenId(openId: string) {
-  const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot get user: database not available");
-    return undefined;
-  }
-
-  const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
-
-  return result.length > 0 ? result[0] : undefined;
-}
-
-// TODO: add feature queries here as your schema grows.
+export async function adminListOpportunities() { const db = await getDb(); if (!db) return []; return db.select().from(opportunities).orderBy(desc(opportunities.sourceUpdatedAt)); }
+export async function adminUpdateOpportunity(id: number, input: Partial<Omit<typeof opportunities.$inferInsert, "id">>) { const db = await getDb(); if (!db) return null; await db.update(opportunities).set({ ...input, sourceUpdatedAt: new Date() }).where(eq(opportunities.id, id)); const rows = await db.select().from(opportunities).where(eq(opportunities.id, id)).limit(1); return rows[0] ?? null; }
