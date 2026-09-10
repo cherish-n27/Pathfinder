@@ -46,14 +46,19 @@ export const appRouter = router({
       const mergedProfile = { ...rawProfile, ...profileUpdates };
       if (Object.keys(profileUpdates).length) await upsertProfile(ctx.user.id, mergedProfile as any);
       if (input.conversationId) await addMessage(ctx.user.id, input.conversationId, "assistant", message);
-      const ready = isPathwayReady(parsed?.pathway);
-      const saveIntent = Boolean(parsed?.save_intent);
-      const pathwayDraft = ready ? parsed.pathway : null;
+      let structuredPathway = isPathwayReady(parsed?.pathway) ? parsed.pathway : null;
+      const pathwayTrigger = /here(?:'|’)s your pathway|here is your pathway|practical pathway|action plan|next steps|recommended direction|pathway to/i.test(message);
+      if (!structuredPathway && pathwayTrigger) {
+        const extraction = await invokeLLM({ messages: [{ role: "system", content: "Extract a complete structured PathFinder pathway from the supplied profile, conversation, and assistant reply. Return a pathway only when the readiness bar is met: goal, education, interests or skills, province, and main constraint must be known. Never invent missing facts; use the closest grounded wording from the context." }, { role: "user", content: `Profile: ${input.profile}\nConversation: ${JSON.stringify(input.history)}\nAssistant reply: ${message}` }], response_format: { type: "json_schema", json_schema: { name: "pathfinder_pathway_extraction", strict: true, schema: pathwayResponseSchema } } });
+        try { const extracted = typeof extraction.choices?.[0]?.message?.content === "string" ? JSON.parse(extraction.choices[0].message.content) : null; if (isPathwayReady(extracted)) structuredPathway = extracted; } catch { structuredPathway = null; }
+      }
+      const ready = isPathwayReady(structuredPathway);
       let pathway = null;
-      if (input.conversationId && ready) await upsertPersonalisedPathwayDraft(ctx.user.id, input.conversationId, parsed.pathway, message);
-      const saveMessage = saveIntent && ready && !pathway ? "I have a ready direction, but I need to see it established in this conversation before I can save it. Keep exploring for one more turn, then ask me to save it." : message;
-      const exposedPathwayDraft = pathwayDraft;
-      return { message: saveIntent && !ready ? `${message} Once we have your goal, education, interests or skills, province, and main constraint, we can create a real pathway for you.` : message, pathway: null, pathwayDraft: input.conversationId ? exposedPathwayDraft : null, profileUpdates: parsed?.profile_updates || {}, saveIntent: false, pathwayReady: ready && Boolean(input.conversationId) };
+      if (input.conversationId && ready) {
+        await upsertPersonalisedPathwayDraft(ctx.user.id, input.conversationId, structuredPathway, message);
+        pathway = await saveConversationPathway(ctx.user.id, input.conversationId);
+      }
+      return { message, pathway, pathwayDraft: input.conversationId && ready ? structuredPathway : null, profileUpdates: parsed?.profile_updates || {}, saveIntent: false, pathwayReady: ready && Boolean(input.conversationId) };
     }),
   }),
   drafts: router({

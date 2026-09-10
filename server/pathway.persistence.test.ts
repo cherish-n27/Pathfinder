@@ -41,11 +41,13 @@ describe("guide pathway persistence flow", () => {
     vi.clearAllMocks();
   });
 
-  it("does not auto-save when the AI reports save intent", async () => {
+  it("immediately saves a ready structured pathway returned by the guide", async () => {
+    const saved = { id: 91, conversationId: 91, isSaved: 1 };
+    saveConversationPathway.mockResolvedValueOnce(saved);
     llmReply(true);
-    const result = await appRouter.createCaller(context).guide.respond({ profile: "{}", history: [], message: "save this", conversationId: 91 });
-    expect(result.pathway).toBeNull();
-    expect(saveConversationPathway).not.toHaveBeenCalled();
+    const result = await appRouter.createCaller(context).guide.respond({ profile: "{}", history: [], message: "Here is your practical pathway", conversationId: 91 });
+    expect(result.pathway).toEqual(saved);
+    expect(saveConversationPathway).toHaveBeenCalledWith(7, 91);
     expect(upsertDraft).toHaveBeenCalledWith(7, 91, readyPathway, expect.any(String));
   });
 
@@ -99,21 +101,14 @@ describe("guide pathway persistence flow", () => {
     ]);
   });
 
-  it("creates a draft first, then promotes that conversation draft on save intent", async () => {
+  it("creates and immediately promotes a complete pathway in one guide response", async () => {
     upsertDraft.mockResolvedValueOnce({ id: 12, conversationId: 92, isSaved: 0 });
     saveConversationPathway.mockResolvedValueOnce({ id: 12, conversationId: 92, isSaved: 1 });
 
     llmReply(false);
-    const draftResult = await appRouter.createCaller(context).guide.respond({ profile: "{}", history: [], message: "show me a direction", conversationId: 92 });
-    expect(draftResult.pathway).toBeNull();
+    const result = await appRouter.createCaller(context).guide.respond({ profile: "{}", history: [], message: "show me a direction", conversationId: 92 });
+    expect(result.pathway).toMatchObject({ id: 12, conversationId: 92, isSaved: 1 });
     expect(upsertDraft).toHaveBeenCalledWith(7, 92, readyPathway, expect.any(String));
-
-    llmReply(true);
-    const readyResult = await appRouter.createCaller(context).guide.respond({ profile: "{}", history: [], message: "save this pathway", conversationId: 92 });
-    expect(readyResult.pathway).toBeNull();
-    expect(saveConversationPathway).not.toHaveBeenCalled();
-    const savedResult = await appRouter.createCaller(context).pathways.save({ conversationId: 92 });
-    expect(savedResult).toMatchObject({ id: 12, conversationId: 92, isSaved: 1 });
     expect(saveConversationPathway).toHaveBeenCalledWith(7, 92);
   });
 });
