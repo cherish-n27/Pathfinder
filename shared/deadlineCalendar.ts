@@ -34,3 +34,14 @@ export function groupDeadlinesByDate<T extends DeadlineItem>(items: T[]) {
 export function deadlineTone(items: DeadlineItem[]) {
   return items.some(item => item.status === "Accepted") ? "green" : "coral";
 }
+
+export function calendarTone(items: DeadlineItem[], now = new Date()) {
+  if (items.some(item => item.status === "Accepted")) return "green";
+  const nowMs = now.getTime();
+  const approaching = items.some(item => {
+    if (!item.status || !["Not started", "Applied"].includes(item.status)) return false;
+    const deadlineMs = new Date(item.deadlineDate).getTime();
+    return !Number.isNaN(deadlineMs) && deadlineMs - nowMs <= 7 * 86400000;
+  });
+  return approaching ? "coral" : "muted";
+}
