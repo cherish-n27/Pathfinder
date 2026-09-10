@@ -32,7 +32,33 @@ export async function deleteApplication(userId: number, id: number) { const db =
 
 export async function getProfile(userId: number) { const db = await getDb(); if (!db) return null; const rows = await db.select().from(profiles).where(eq(profiles.userId, userId)).limit(1); return rows[0] ?? null; }
 
-export async function searchLiveOpportunities(query: string, category?: string, province?: string) { const searchQuery = [query || "South Africa youth career opportunities", category, province].filter(Boolean).join(" "); const apiKey = process.env.TAVILY_API_KEY; if (!apiKey) return { results: [], fallback: true, message: "Live search is not configured, so you are seeing curated opportunities." }; try { const response = await fetch("https://api.tavily.com/search", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: apiKey, query: searchQuery, search_depth: "basic", max_results: 8, include_answer: false }) }); if (!response.ok) return { results: [], fallback: true, message: "Live search is temporarily unavailable, so you are seeing curated opportunities." }; const payload = await response.json() as { results?: { title?: string; url?: string; content?: string }[] }; const results = (payload.results || []).map(item => ({ ...item, url: normalizeSourceUrl(item.url) })).filter(item => Boolean(item.url)).map(item => { const title = item.title || "Opportunity from live search"; const categoryGuess = /bursar|univers|college|course|study|scholar/i.test(title) ? "Study" : /job|intern|work|employment|learnership/i.test(title) ? "Work" : /business|enterprise|entrepreneur|fund/i.test(title) ? "Business" : "Skills"; return { id: undefined, name: title, organisation: new URL(item.url!).hostname.replace(/^www\./, ""), category: categoryGuess, description: (item.content || "Review the official source for current requirements.").slice(0, 260), traits: "Live result,verify source", province: province || "National", deadlineDate: null, sourceUrl: item.url!, sourceUpdatedAt: new Date(), source: "live" as const }; }); return { results, fallback: false, message: "From live search — verify before applying." }; } catch { return { results: [], fallback: true, message: "Live search timed out, so you are seeing curated opportunities." }; } }
+export async function searchLiveOpportunities(query: string, category?: string, province?: string) {
+  const searchQuery = [query || "South Africa youth career opportunities", category, province].filter(Boolean).join(" ");
+  const serpKey = process.env.SERPAPI_API_KEY;
+  const tavilyKey = process.env.TAVILY_API_KEY;
+  if (!serpKey && !tavilyKey) return { results: [], fallback: true, message: "Live search is not configured, so you are seeing curated opportunities." };
+  try {
+    let items: { title?: string; url?: string; content?: string }[] = [];
+    if (serpKey) {
+      const url = new URL("https://serpapi.com/search.json");
+      url.searchParams.set("engine", "google");
+      url.searchParams.set("q", searchQuery);
+      url.searchParams.set("api_key", serpKey);
+      url.searchParams.set("num", "8");
+      const response = await fetch(url);
+      if (!response.ok) return { results: [], fallback: true, message: "Live search is temporarily unavailable, so you are seeing curated opportunities." };
+      const payload = await response.json() as { organic_results?: { title?: string; link?: string; snippet?: string }[] };
+      items = (payload.organic_results || []).map(item => ({ title: item.title, url: item.link, content: item.snippet }));
+    } else {
+      const response = await fetch("https://api.tavily.com/search", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ api_key: tavilyKey, query: searchQuery, search_depth: "basic", max_results: 8, include_answer: false }) });
+      if (!response.ok) return { results: [], fallback: true, message: "Live search is temporarily unavailable, so you are seeing curated opportunities." };
+      const payload = await response.json() as { results?: { title?: string; url?: string; content?: string }[] };
+      items = payload.results || [];
+    }
+    const results = items.map(item => ({ ...item, url: normalizeSourceUrl(item.url) })).filter(item => Boolean(item.url)).map(item => { const title = item.title || "Opportunity from live search"; const categoryGuess = /bursar|univers|college|course|study|scholar/i.test(title) ? "Study" : /job|intern|work|employment|learnership/i.test(title) ? "Work" : /business|enterprise|entrepreneur|fund/i.test(title) ? "Business" : "Skills"; return { id: undefined, name: title, organisation: new URL(item.url!).hostname.replace(/^www\./, ""), category: categoryGuess, description: (item.content || "Review the official source for current requirements.").slice(0, 260), traits: "Live result,verify source", province: province || "National", deadlineDate: null, sourceUrl: item.url!, sourceUpdatedAt: new Date(), source: "live" as const }; });
+    return { results, fallback: false, message: "From live search — verify before applying." };
+  } catch { return { results: [], fallback: true, message: "Live search timed out, so you are seeing curated opportunities." }; }
+}
 
 type StructuredPathwayInput = { recommended_direction: string; goal: string; education: string; interests_or_skills: string; province: string; constraint: string; reasons: string; next_steps: string[]; immediate_action: string };
 
